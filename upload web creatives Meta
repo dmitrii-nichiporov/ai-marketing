@@ -1,0 +1,238 @@
+/** * --- НАСТРОЙКИ --- */
+const ACCESS_TOKEN = 'access meta token';const AD_ACCOUNT_ID = 'act_account id'; 
+const PAGE_ID = 'page id'; 
+/** * ПРИМЕЧАНИЕ: Ваши константы ACCESS_TOKEN, AD_ACCOUNT_ID и PAGE_ID 
+ * должны быть прописаны в самом верху этого файла!
+ */
+
+function runAutoUploader() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('ads'); 
+  
+  if (!sheet) {
+    console.error("❌ Ошибка: Лист с названием 'ads' не найден!");
+    return;
+  }
+
+  const rows = sheet.getDataRange().getValues();
+  const videoLibrary = getLibraryVideos();
+
+  // 1. ПОЛУЧАЕМ ПРАВИЛЬНЫЙ IG USER ID
+  const igUserId = fetchIgFromAdAccount();
+
+  for (let i = 1; i < rows.length; i++) {
+    let [sourceId, dummyName, folderInput, headline, body, linkUrl, status] = rows[i];
+    if (!folderInput || String(folderInput).trim().length < 10) continue;
+
+    try {
+      let targetAdSetId = String(sourceId).replace(/[^0-9]/g, '');
+      let match = String(folderInput).match(/[-\w]{25,}/);
+      if (!match) throw new Error("Неверная ссылка на папку Drive");
+      let folderId = match[0];
+      
+      // Берем имя папки напрямую из Google Drive для названия объявления
+      let finalAdName = DriveApp.getFolderById(folderId).getName();
+      
+      // ПРОВЕРКА НАЛИЧИЯ ОБЪЯВЛЕНИЯ В ФЕЙСБУКЕ
+      if (isAdExisting(targetAdSetId, finalAdName)) {
+        if (status !== "DONE") sheet.getRange(i + 1, 7).setValue("DONE");
+        console.log(`⏭️ Пропуск: Объявление '${finalAdName}' уже существует.`);
+        continue;
+      }
+
+      console.log(`>>> Создание: '${finalAdName}'`);
+      
+      // Ищем видео 3-х разрешений в папке
+      let videos = getVideosByResolution(folderId);
+      let ids = { sq: null, vert: null, hor: null };
+      
+      const formats = [
+        { key: 'sq', res: '1080x1080', url: videos.square }, 
+        { key: 'vert', res: '1080x1920', url: videos.vertical },
+        { key: 'hor', res: '1920x1080', url: videos.horizontal }
+      ];
+
+      for (let f of formats) {
+        if (!f.url) continue;
+        let searchKey = `${folderId}_${f.res}`; 
+        ids[f.key] = videoLibrary[searchKey] || uploadAndAwaitMeta(f.url, searchKey);
+      }
+
+      // 3. СОЗДАНИЕ КРЕАТИВА С ПОВТОРАМИ
+      let creativeId = createCreativeWithRetry(ids, headline, body, linkUrl, finalAdName, igUserId);
+
+      // 4. СОЗДАНИЕ ОБЪЯВЛЕНИЯ
+      let res = UrlFetchApp.fetch(`https://graph.facebook.com/v22.0/${AD_ACCOUNT_ID}/ads`, {
+        'method': 'post', 'payload': {
+          'name': finalAdName, 
+          'adset_id': targetAdSetId,
+          'creative': JSON.stringify({'creative_id': creativeId}),
+          'status': 'PAUSED',
+          'access_token': ACCESS_TOKEN
+        }, 'muteHttpExceptions': true
+      });
+      
+      let resJson = JSON.parse(res.getContentText());
+      if (resJson.error) throw new Error("Ads API: " + res.getContentText());
+
+      sheet.getRange(i + 1, 7).setValue("DONE");
+      console.log(`🏁 УСПЕХ: Объявление '${finalAdName}' создано.`);
+      
+    } catch (e) {
+      sheet.getRange(i + 1, 7).setValue("ERROR: " + e.message);
+      console.error("Сбой: " + e.message);
+    }
+  }
+}
+
+/**
+ * Проверяет наличие живого объявления в AdSet
+ */
+function isAdExisting(adSetId, adName) {
+  let url = `https://graph.facebook.com/v22.0/${adSetId}/ads?fields=name,status&limit=100&access_token=${ACCESS_TOKEN}`;
+  let res = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+  let json = JSON.parse(res.getContentText());
+  if (json.data) {
+    for (let ad of json.data) {
+      if (ad.name === adName && ad.status !== 'DELETED') return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Пытается создать креатив, ожидая обработку видео
+ */
+function createCreativeWithRetry(ids, title, body, link, adName, igUserId) {
+  let maxRetries = 4;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return createV22Creative(ids, title, body, link, adName, igUserId);
+    } catch(e) {
+      if (e.message.includes("1885252") || e.message.includes("processing")) {
+        console.log(`⏳ Видео еще обрабатывается. Ждем 15 сек (попытка ${attempt}/${maxRetries})...`);
+        Utilities.sleep(15000); 
+      } else throw e;
+    }
+  }
+}
+
+/**
+ * Формирует структуру креатива согласно вашим плейсментам
+ */
+function createV22Creative(ids, title, body, link, adName, igUserId) {
+  let videosPool = [];
+  let rules = [];
+
+  // Вертикаль -> Stories, Reels, Audience Network
+  if (ids.vert) {
+    videosPool.push({ "video_id": String(ids.vert), "adlabels": [{ "name": "v" }] });
+    rules.push({ 
+      "customization_spec": { 
+        "publisher_platforms": ["facebook", "instagram", "audience_network"], 
+        "facebook_positions": ["story", "facebook_reels"], 
+        "instagram_positions": ["story", "reels"],
+        "audience_network_positions": ["classic"] 
+      }, "video_label": { "name": "v" } 
+    });
+  }
+
+  // Квадрат -> Feeds, In-stream for Reels
+  let mainId = ids.sq || ids.vert || ids.hor;
+  if (mainId) {
+    videosPool.push({ "video_id": String(mainId), "adlabels": [{ "name": "s" }] });
+    rules.push({ 
+      "customization_spec": { 
+        "publisher_platforms": ["facebook", "instagram"], 
+        "facebook_positions": ["feed", "video_feeds"], 
+        "instagram_positions": ["stream"] 
+      }, "video_label": { "name": "s" } 
+    });
+  }
+
+  // Горизонталь -> Facebook Search results
+  if (ids.hor) {
+    videosPool.push({ "video_id": String(ids.hor), "adlabels": [{ "name": "h" }] });
+    rules.push({ 
+      "customization_spec": { 
+        "publisher_platforms": ["facebook"], 
+        "facebook_positions": ["search"] 
+      }, "video_label": { "name": "h" } 
+    });
+  }
+
+  let payload = {
+    'name': adName, 
+    'object_story_spec': JSON.stringify({ 'page_id': String(PAGE_ID), 'instagram_user_id': String(igUserId) }),
+    'asset_feed_spec': JSON.stringify({
+      "videos": videosPool, "bodies": [{"text": String(body || " ")}], "titles": [{"text": String(title || " ")}],
+      "ad_formats": ["SINGLE_VIDEO"], "link_urls": [{"website_url": String(link).trim()}],
+      "call_to_action_types": ["LEARN_MORE"], "asset_customization_rules": rules
+    }),
+    'access_token': ACCESS_TOKEN
+  };
+
+  let res = UrlFetchApp.fetch(`https://graph.facebook.com/v22.0/${AD_ACCOUNT_ID}/adcreatives`, { 'method': 'post', 'payload': payload, 'muteHttpExceptions': true });
+  let json = JSON.parse(res.getContentText());
+  if (json.error) throw new Error("Creative Error: " + res.getContentText());
+  return json.id;
+}
+
+/**
+ * Получает одобренный IG ID из активов кабинета
+ */
+function fetchIgFromAdAccount() {
+  let url = `https://graph.facebook.com/v22.0/${AD_ACCOUNT_ID}/instagram_accounts?fields=id,username&access_token=${ACCESS_TOKEN}`;
+  let res = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+  let json = JSON.parse(res.getContentText());
+  if (json.data && json.data.length > 0) return json.data[0].id;
+  throw new Error("Instagram аккаунт не привязан к этому рекламному кабинету в Business Manager.");
+}
+
+/**
+ * Список уже загруженных видео
+ */
+function getLibraryVideos() {
+  let url = `https://graph.facebook.com/v22.0/${AD_ACCOUNT_ID}/advideos?fields=description&limit=500&access_token=${ACCESS_TOKEN}`;
+  let data = JSON.parse(UrlFetchApp.fetch(url, {muteHttpExceptions: true}).getContentText()).data;
+  let map = {};
+  if (data) data.forEach(v => { if (v.description) map[v.description] = v.id; });
+  return map;
+}
+
+/**
+ * Загрузка видео с ожиданием статуса 'ready'
+ */
+function uploadAndAwaitMeta(driveUrl, description) {
+  let fileId = driveUrl.match(/[-\w]{25,}/)[0];
+  let res = UrlFetchApp.fetch(`https://graph-video.facebook.com/v22.0/${AD_ACCOUNT_ID}/advideos`, { 
+    'method': 'post', 'payload': { 'file_url': "https://drive.google.com/uc?export=download&id=" + fileId, 'description': description, 'access_token': ACCESS_TOKEN },
+    'muteHttpExceptions': true
+  });
+  let videoId = JSON.parse(res.getContentText()).id;
+  
+  let attempts = 0;
+  while (attempts < 24) {
+    Utilities.sleep(5000); 
+    let statusJson = JSON.parse(UrlFetchApp.fetch(`https://graph.facebook.com/v22.0/${videoId}?fields=status&access_token=${ACCESS_TOKEN}`, {muteHttpExceptions: true}).getContentText());
+    if (statusJson.status && statusJson.status.video_status === 'ready') return videoId;
+    attempts++;
+  }
+  return videoId;
+}
+
+/**
+ * Поиск файлов в Drive по разрешению
+ */
+function getVideosByResolution(folderId) {
+  let files = DriveApp.getFolderById(folderId).getFiles();
+  let found = { square: null, vertical: null, horizontal: null };
+  while (files.hasNext()) {
+    let file = files.next();
+    let name = file.getName();
+    if (name.includes('1080x1080')) found.square = file.getUrl();
+    if (name.includes('1080x1920')) found.vertical = file.getUrl();
+    if (name.includes('1920x1080')) found.horizontal = file.getUrl();
+  }
+  return found;
+}
