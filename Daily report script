@@ -1,5 +1,5 @@
 /**
- * Создание меню при открытии таблицы
+ * Создание меню
  */
 function onOpen() {
   try {
@@ -13,38 +13,49 @@ function onOpen() {
 }
 
 /**
- * Основная функция импорта и расчета
+ * Основная функция
  */
 function updateRowDataFinal() {
-  const FOLDER_ID = 'folder id google drive'; 
+  const FOLDER_ID = 'folder name'; 
   const SHEET_NAME = 'row data'; 
   const PREDICT_SHEET = 'predict';
+  const OPT_LOG_SHEET = 'optimization log'; 
   
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(SHEET_NAME);
   const predictSheet = ss.getSheetByName(PREDICT_SHEET);
+  const optLogSheet = ss.getSheetByName(OPT_LOG_SHEET);
   const folder = DriveApp.getFolderById(FOLDER_ID);
 
-  // 1. Поиск файлов (выбираем самый свежий Date performance по названию)
+  if (sheet.getMaxColumns() < 29) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), 29 - sheet.getMaxColumns());
+  }
+
+  // 1. Поиск файлов (запоминаем названия для отчета)
   let dateFile = null, mediaFile = null;
-  let maxDateValueDate = -1;
-  const files = folder.getFilesByType(MimeType.CSV);
+  let dateFileName = "Не найден", mediaFileName = "Не найден";
+  let maxDateValueDate = -1, maxDateValueMedia = -1;
   
+  const files = folder.getFilesByType(MimeType.CSV);
   while (files.hasNext()) {
     let file = files.next();
     let name = file.getName();
     let fileDate = getEndDateFromFileName(name);
-    if (fileDate && name.includes("Date performance") && fileDate.getTime() > maxDateValueDate) {
-      maxDateValueDate = fileDate.getTime(); 
-      dateFile = file;
-    } else if (name.includes("Media source performance")) {
-      mediaFile = file;
+    
+    if (fileDate) {
+      let time = fileDate.getTime();
+      if (name.includes("Date performance") && time > maxDateValueDate) {
+        maxDateValueDate = time; dateFile = file; dateFileName = name;
+      } 
+      else if (name.includes("Media source performance") && time > maxDateValueMedia) {
+        maxDateValueMedia = time; mediaFile = file; mediaFileName = name;
+      }
     }
   }
 
-  if (!dateFile || !mediaFile) return safeAlert('Ошибка: Файлы не найдены в папке Drive.');
+  if (!dateFile || !mediaFile) return safeAlert('Ошибка! Файлы не найдены.\nДата: ' + dateFileName + '\nМедиа: ' + mediaFileName);
 
-  // 2. Загрузка справочника коэффициентов (Колонка A - ключ, B-G - IAP, H-M - IAA)
+  // 2. Справочник предикта
   const predictData = predictSheet.getDataRange().getValues();
   const predictMap = {};
   for (let i = 1; i < predictData.length; i++) {
@@ -56,20 +67,35 @@ function updateRowDataFinal() {
     };
   }
 
-  // 3. Обновление справочника Media Source (AE:AX)
+  // 3. Логи оптимизации
+  const moveMap = {};
+  let logsLoadedCount = 0;
+  if (optLogSheet) {
+    const optData = optLogSheet.getDataRange().getValues();
+    for (let i = 1; i < optData.length; i++) {
+      let campName = String(optData[i][2]).trim(), dateRaw = optData[i][6], moveVal = String(optData[i][7]).trim();
+      if (campName && dateRaw && moveVal) {
+        let d = (dateRaw instanceof Date) ? dateRaw : new Date(dateRaw);
+        if (!isNaN(d.getTime())) {
+          let key = campName + "_" + Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+          moveMap[key] = moveMap[key] ? moveMap[key] + " | " + moveVal : moveVal;
+          logsLoadedCount++;
+        }
+      }
+    }
+  }
+
+  // 4. Справочник Media Source
   const mediaCsvData = Utilities.parseCsv(mediaFile.getBlob().getDataAsString());
   const mediaRows = mediaCsvData.slice(1);
   sheet.getRange(2, 31, sheet.getMaxRows(), 20).clearContent();
   if (mediaRows.length > 0) sheet.getRange(2, 31, mediaRows.length, mediaRows[0].length).setValues(mediaRows);
-  
   const lookupMap = {};
   mediaRows.forEach(row => { if (row[0]) lookupMap[row[0].toString().trim()] = row[1]; });
 
-  // 4. Обработка основных данных
+  // 5. Обработка данных (Net 15%, Fallback D1, Matching)
   const dateCsvData = Utilities.parseCsv(dateFile.getBlob().getDataAsString());
   const dateRows = dateCsvData.slice(1);
-
-  // Находим "Опорную дату" (максимальный день внутри данных)
   let maxTime = 0;
   dateRows.forEach(row => {
     let d = new Date(row[1]);
@@ -78,31 +104,23 @@ function updateRowDataFinal() {
   const anchorDate = new Date(maxTime); anchorDate.setHours(0,0,0,0);
 
   const finalData = dateRows.map(row => {
-    // Берем строго 20 колонок из CSV, чтобы избежать сдвигов
     let cleanRow = row.slice(0, 20);
     while(cleanRow.length < 20) cleanRow.push(""); 
-
-    // Вычитаем комиссию 15% из IAP Revenue (индексы 10, 11, 12, 13, 14)
-    for (let i = 10; i <= 14; i++) {
-      cleanRow[i] = parseNum(cleanRow[i]) * 0.85; 
-    }
+    for (let i = 10; i <= 14; i++) { cleanRow[i] = parseNum(cleanRow[i]) * 0.85; } // IAP Net 15%
 
     let campaign = cleanRow[0] ? cleanRow[0].toString().trim() : "";
-    const dateStr = cleanRow[1];
-    let diffDays = 0, mondayStr = "";
+    let dateStrRaw = cleanRow[1], diffDays = 0, mondayStr = "", matchDate = "";
     
-    if (dateStr) {
-      let dObj = new Date(dateStr); dObj.setHours(0,0,0,0);
-      let day = dObj.getDay();
-      let monday = new Date(dObj.setDate(dObj.getDate() - day + (day == 0 ? -6 : 1)));
+    if (dateStrRaw) {
+      let dObj = new Date(dateStrRaw); dObj.setHours(0,0,0,0);
+      let monday = new Date(dObj.setDate(dObj.getDate() - dObj.getDay() + (dObj.getDay() == 0 ? -6 : 1)));
       mondayStr = Utilities.formatDate(monday, Session.getScriptTimeZone(), "yyyy-MM-dd");
-      
-      dObj = new Date(dateStr); dObj.setHours(0,0,0,0);
+      dObj = new Date(dateStrRaw); dObj.setHours(0,0,0,0);
       diffDays = Math.round((anchorDate.getTime() - dObj.getTime()) / 86400000);
+      matchDate = Utilities.formatDate(dObj, Session.getScriptTimeZone(), "yyyy-MM-dd");
     }
 
-    const titleName = campaign.split('_')[0];
-    const plat = campaign.toLowerCase().includes('ios') ? 'ios' : (campaign.toLowerCase().includes('and') ? 'and' : '');
+    const titleName = campaign.split('_')[0], plat = campaign.toLowerCase().includes('ios') ? 'ios' : (campaign.toLowerCase().includes('and') ? 'and' : '');
     const key = (titleName + plat).toUpperCase().replace(/[^A-Z0-9]/g, '');
 
     let iap = {val: 0, log: ""}, iaa = {val: 0, log: ""};
@@ -111,85 +129,46 @@ function updateRowDataFinal() {
       iaa = calculatePredictWithLog(cleanRow, 15, diffDays, predictMap[key]["IAA"], "IAA Gross");
     }
 
-    // Возвращаем: A:T(20) + Source(1) + Week(1) + Title(1) + Platform(1) + Predicts(3) + Log(1) = 28 колонок
-    return [
-      ...cleanRow, 
-      (lookupMap[campaign] || "Не найден"), 
-      mondayStr, 
-      titleName, 
-      plat, 
-      iap.val, 
-      iaa.val, 
-      (iap.val + iaa.val), 
-      iap.log + " | " + iaa.log
-    ];
+    return [...cleanRow, (lookupMap[campaign] || "Не найден"), mondayStr, titleName, plat, iap.val, iaa.val, (iap.val + iaa.val), iap.log + " | " + iaa.log, moveMap[campaign + "_" + matchDate] || ""];
   });
 
-  // Запись и форматирование
-  sheet.getRange("U1:AB1").setValues([["Media Source", "Week", "title_name", "Platform", "predict_iap_rev", "predict_ad_rev", "predictive_revenue", "Calculation Log"]]);
-  const currentMaxRows = sheet.getMaxRows();
-  if (currentMaxRows > 1) sheet.getRange(2, 1, currentMaxRows - 1, 28).clearContent();
-  
+  // Вывод в лист
+  sheet.getRange(1, 21, 1, 9).setValues([["Media Source", "Week", "title_name", "Platform", "predict_iap_rev", "predict_ad_rev", "predictive_revenue", "Calculation Log", "Optimization MOVE"]]);
+  if (sheet.getMaxRows() > 1) sheet.getRange(2, 1, sheet.getMaxRows() - 1, 29).clearContent();
   if (finalData.length > 0) {
-    sheet.getRange(2, 1, finalData.length, 28).setValues(finalData);
+    sheet.getRange(2, 1, finalData.length, 29).setValues(finalData);
     sheet.getRange(2, 22, finalData.length, 1).setNumberFormat("yyyy-MM-dd");
     sheet.getRange(2, 25, finalData.length, 3).setNumberFormat("0.00");
   }
 
-  safeAlert('Готово! Опорная дата расчета: ' + Utilities.formatDate(anchorDate, Session.getScriptTimeZone(), "yyyy-MM-dd"));
+  // Финальный отчет
+  let finalMsg = "✅ Обновление завершено!\n\n" +
+                 "📂 Файл данных (Date): " + dateFileName + "\n" +
+                 "📂 Файл источников (Media): " + mediaFileName + "\n" +
+                 "📝 Найдено матчей в логах: " + logsLoadedCount;
+  safeAlert(finalMsg);
 }
 
 /**
- * Парсинг даты из имени файла
+ * Вспомогательные функции
  */
-function getEndDateFromFileName(n) { 
-  let m = n.match(/- ([A-Z][a-z]{2} \d{1,2}, \d{4})/); 
-  return m ? new Date(m[1]) : null; 
-}
+function getEndDateFromFileName(n) { let m = n.match(/- ([A-Z][a-z]{2} \d{1,2}, \d{4})/); return m ? new Date(m[1]) : null; }
+function parseNum(v) { return Number(String(v).replace(/\s/g, '').replace(',', '.')) || 0; }
+function safeAlert(msg) { try { SpreadsheetApp.getUi().alert(msg); } catch (e) { Logger.log("ALERT: " + msg); } }
 
-/**
- * Чистка чисел
- */
-function parseNum(v) { 
-  if (typeof v === 'number') return v;
-  return Number(String(v).replace(/\s/g, '').replace(',', '.')) || 0; 
-}
-
-/**
- * Безопасный вызов Alert
- */
-function safeAlert(msg) {
-  try {
-    SpreadsheetApp.getUi().alert(msg);
-  } catch (e) {
-    Logger.log("ALERT: " + msg);
-  }
-}
-
-/**
- * Математика предикта с логированием формулы
- */
 function calculatePredictWithLog(row, baseIndex, diffDays, multipliers, label) {
   if (!multipliers) return {val: 0, log: label + ": No Mult"};
   let baseRev = 0, startIdx = -1, baseName = "";
-  
-  // Проверяем наличие денег по убыванию возраста закрытой когорты
   if (diffDays >= 30 && parseNum(row[baseIndex + 4]) > 0) { baseRev = parseNum(row[baseIndex + 4]); startIdx = 3; baseName = "D30"; } 
   else if (diffDays >= 7 && parseNum(row[baseIndex + 2]) > 0) { baseRev = parseNum(row[baseIndex + 2]); startIdx = 2; baseName = "D7"; } 
   else if (diffDays >= 3 && parseNum(row[baseIndex + 1]) > 0) { baseRev = parseNum(row[baseIndex + 1]); startIdx = 1; baseName = "D3"; } 
   else if (diffDays >= 1 && parseNum(row[baseIndex + 0]) > 0) { baseRev = parseNum(row[baseIndex + 0]); startIdx = 0; baseName = "D1"; }
-  
   if (startIdx === -1 || baseRev === 0) return {val: 0, log: label + ": No Base"};
-  
   let res = baseRev;
   let formula = baseRev.toFixed(2) + "(" + baseName + ")";
   const mNames = ["3/1", "7/3", "30/7", "60/30", "90/60", "180/90"];
-  
   for (let i = startIdx; i < multipliers.length; i++) {
-    if (multipliers[i] > 0) { 
-      res *= multipliers[i]; 
-      formula += " * " + multipliers[i] + "[" + mNames[i] + "]"; 
-    }
+    if (multipliers[i] > 0) { res *= multipliers[i]; formula += " * " + multipliers[i] + "[" + mNames[i] + "]"; }
   }
   return {val: res, log: label + ": " + formula};
 }
