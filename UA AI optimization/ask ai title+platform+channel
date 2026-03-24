@@ -1,0 +1,173 @@
+function runAIRecommendationsChannel() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('title+platform+channel');
+  const ui = SpreadsheetApp.getUi();
+
+  if (!sheet) {
+    ui.alert('Ошибка', 'Вкладка "title+platform+channel" не найдена.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // 1. Сбор правил
+  const rulesSheet = ss.getSheetByName('rules optimization');
+  if (!rulesSheet) {
+    ui.alert('Ошибка', 'Не найдена вкладка "rules optimization".', ui.ButtonSet.OK);
+    return;
+  }
+  
+  const rulesData = rulesSheet.getDataRange().getDisplayValues();
+  let targetColIdx = -1;
+  let ruleHeaders = rulesData[0];
+  for (let i = 0; i < ruleHeaders.length; i++) {
+    if (String(ruleHeaders[i]).trim().toLowerCase() === 'title+platform+channel') {
+      targetColIdx = i;
+      break;
+    }
+  }
+
+  if (targetColIdx === -1) {
+    ui.alert('Ошибка', 'Колонка "title+platform+channel" не найдена в правилах.', ui.ButtonSet.OK);
+    return;
+  }
+
+  let rulesArr = [];
+  for (let i = 1; i < rulesData.length; i++) {
+    let cellText = rulesData[i][targetColIdx] ? String(rulesData[i][targetColIdx]).trim() : "";
+    if (cellText !== "") rulesArr.push(cellText);
+  }
+  let rulesText = rulesArr.join("\n");
+
+  // 2. Сбор данных
+  const data = sheet.getDataRange().getDisplayValues(); 
+  if (data.length <= 1) return;
+  
+  // ВСТАВЬ СВОЙ КЛЮЧ ЗДЕСЬ
+  const apiKey = " ВСТАВЬ СВОЙ КЛЮЧ ЗДЕСЬ"; 
+  const models = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"];
+  const url = "https://api.anthropic.com/v1/messages";
+  
+  let blocks = [];
+  let currentTitle = "", currentPlatform = "", currentMedia = "";
+  let blockStartRow = -1, blockRows = [];
+
+  for (let i = 1; i < data.length; i++) {
+    let titleCell = data[i][0], platformCell = data[i][1], mediaCell = data[i][2];
+    if (titleCell !== "") {
+      if (blockRows.length > 0) {
+        processBlock(blocks, currentTitle, currentPlatform, currentMedia, blockStartRow, blockRows);
+      }
+      currentTitle = titleCell; currentPlatform = platformCell; currentMedia = mediaCell;
+      blockStartRow = i + 1; blockRows = [data[i]];
+    } else {
+      blockRows.push(data[i]);
+    }
+  }
+  processBlock(blocks, currentTitle, currentPlatform, currentMedia, blockStartRow, blockRows);
+
+  let activeBlocks = blocks.filter(b => b.shouldAnalyze);
+  if (activeBlocks.length === 0) {
+    ui.alert('Инфо', 'Нет данных для анализа (нулевой спенд).', ui.ButtonSet.OK);
+    return;
+  }
+
+  // 3. Формирование промпта (по документации /messages)
+  let systemPrompt = `Ты аналитик Performance Marketing. Дай краткую рекомендацию (1-2 предложения) для каждой связки.
+ВАЖНО: Решение принимается на основе данных ПОСЛЕДНЕЙ НЕДЕЛИ [LATEST]. Предыдущие — для оценки WoW динамики.
+ПРАВИЛА ОПТИМИЗАЦИИ:
+${rulesText}
+
+Отвечай СТРОГО в формате JSON массива объектов: [{"id": "...", "text": "..."}]. Только чистый JSON без пояснений.`;
+
+  let userContent = "Проанализируй следующие данные:\n";
+  for (let b of activeBlocks) {
+    userContent += `\nID: ${b.id}\nСвязка: ${b.title} | ${b.platform} | ${b.media}\n`;
+    for (let j = 0; j < b.rows.length; j++) {
+      let r = b.rows[j];
+      let label = (j === b.rows.length - 1) ? "[LATEST]" : "[PREVIOUS]";
+      userContent += `${label} Нед: ${r[3]} | Spend: ${r[5]} | pRev: ${r[6]} | ROAS: ${r[7]} | CPI: ${r[8]}\n`;
+    }
+  }
+
+  const userConfirm = ui.alert('Claude Sonnet Analysis', `Отправляем ${activeBlocks.length} блоков. Продолжить?`, ui.ButtonSet.YES_NO);
+  if (userConfirm !== ui.Button.YES) return;
+
+  let recColIdx = data[0].indexOf("AI Recommendation") + 1 || data[0].length + 1;
+  sheet.getRange(1, recColIdx).setValue("AI Recommendation").setFontWeight("bold").setBackground("#f3f3f3");
+
+  // 4. Каскадный запрос
+  let parsedResults = {};
+  let success = false;
+  let lastError = "";
+
+  for (let currentModel of models) {
+    try {
+      const payload = {
+        "model": currentModel,
+        "max_tokens": 4096, // Обязательный параметр
+        "system": systemPrompt,
+        "messages": [{"role": "user", "content": userContent}],
+        "temperature": 0.1
+      };
+      
+      const options = {
+        "method": "post",
+        "headers": {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json"
+        },
+        "payload": JSON.stringify(payload),
+        "muteHttpExceptions": true
+      };
+
+      const res = UrlFetchApp.fetch(url, options);
+      const resText = res.getContentText();
+      const resCode = res.getResponseCode();
+      const json = JSON.parse(resText);
+      
+      if (resCode === 200) {
+        let aiResponseText = json.content[0].text.trim();
+        // Извлечение JSON массива
+        if (aiResponseText.includes("[")) {
+          aiResponseText = aiResponseText.substring(aiResponseText.indexOf("["), aiResponseText.lastIndexOf("]") + 1);
+        }
+        let aiArray = JSON.parse(aiResponseText);
+        for (let item of aiArray) parsedResults[item.id] = item.text;
+        success = true;
+        break;
+      } else {
+        lastError = `Модель ${currentModel} (Код ${resCode}): ${json.error ? json.error.message : resText}`;
+      }
+    } catch (e) { 
+      lastError = `Ошибка исполнения: ${e.message}`;
+    }
+  }
+
+  // 5. Вывод
+  if (success) {
+    for (let b of blocks) {
+      let result = b.shouldAnalyze ? (parsedResults[b.id] || "No AI response") : "No recommendation (Zero spend)";
+      let range = sheet.getRange(b.startRow, recColIdx, b.rows.length, 1);
+      sheet.getRange(b.startRow, recColIdx).setValue(result);
+      if (b.rows.length > 1) range.merge();
+      range.setWrap(true).setVerticalAlignment("middle").setBorder(null, null, true, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    }
+    ui.alert('Готово', 'Все рекомендации успешно загружены.', ui.ButtonSet.OK);
+  } else {
+    ui.alert('Ошибка Claude API', `Ни одна модель не ответила.\n\n${lastError}`, ui.ButtonSet.OK);
+  }
+}
+
+function processBlock(blocks, title, platform, media, startRow, rows) {
+  if (rows.length === 0) return;
+  let lastRow = rows[rows.length - 1];
+  let lastSpend = String(lastRow[5]).replace(/[^0-9.]/g, ''); 
+  let shouldAnalyze = (Number(lastSpend) > 0);
+  
+  blocks.push({
+    id: `ID_${startRow}_${title.slice(0,3)}_${media.slice(0,3)}`,
+    title: title, platform: platform, media: media,
+    startRow: startRow, rows: rows, shouldAnalyze: shouldAnalyze
+  });
+}
+  
