@@ -1,0 +1,704 @@
+/**
+ * IAP revenue × 0.85 (store commission). IAA revenue taken as-is.
+ *
+ * ── HOW TO ADD A RUN BUTTON IN GOOGLE SHEETS ────────────────────────────────
+ * 1. Open the spreadsheet: SHEET_URL below
+ * 2. Extensions → Apps Script → paste this entire script → Save (Ctrl+S)
+ * 3. Go back to the Sheet → Insert → Image → Insert Image over cells
+ * 4. Click the three dots on the image → Assign script → type: runScript → OK
+ * 5. Click the image to run. Authorize on first run.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
+
+var FOLDER_URL = 'https://drive.google.com/drive/folders/1_ARFcUizI5cl-SYi9p00_';
+var SHEET_URL  = 'https://docs.google.com/spreadsheets/d/1JmzlfWXh_H3GejP8ZPxp97ohEGo/edit?gid=0#gid=0';
+
+var STORE_COMMISSION = 0.85; // applied to IAP revenue only
+
+// App definitions — name shown in sheet, android app id, ios app id
+// Set to null if platform doesn't exist for that title
+var APPS = [
+  {
+    name    : 'IBS3',
+    android : 'com.elephantgames.icebound.secrets.endless.night.mystery.googf2p',
+    ios     : 'id6745792997',
+    windows : ['D3/D1', 'D7/D3', 'D30/D7', 'D60/D30', 'D90/D60', 'D180/D90']
+  },
+  {
+    name    : 'IBS1',
+    android : 'com.elephantgames.is.hidden.objects.googf2p',
+    ios     : 'id6572296206',
+    windows : ['D3/D1', 'D7/D3', 'D30/D7', 'D60/D30', 'D90/D60', 'D180/D90']
+  },
+  {
+    name    : 'IBS2',
+    android : 'com.elephantgames.icebound.secrets.soul.hunter.googf2p',
+    ios     : 'id6746648860',
+    windows : ['D3/D1', 'D7/D3', 'D30/D7', 'D60/D30', 'D90/D60', 'D180/D90']
+  }
+];
+
+// ─── COLUMN NAMES (must match CSV headers exactly) ───────────────────────────
+
+var COL_APP  = 'App';
+var COL_DATE = 'Date';
+
+// Map window key → { iap column, ad column, days }
+var WINDOW_COLS = {
+  'D1'  : { iap: 'Revenue 1 days cumulative appsflyer af_purchase',   ad: 'Revenue 1 days cumulative appsflyer af_ad_revenue',   days: 1   },
+  'D3'  : { iap: 'Revenue 3 days cumulative appsflyer af_purchase',   ad: 'Revenue 3 days cumulative appsflyer af_ad_revenue',   days: 3   },
+  'D7'  : { iap: 'Revenue 7 days cumulative appsflyer af_purchase',   ad: 'Revenue 7 days cumulative appsflyer af_ad_revenue',   days: 7   },
+  'D30' : { iap: 'Revenue 30 days cumulative appsflyer af_purchase',  ad: 'Revenue 30 days cumulative appsflyer af_ad_revenue',  days: 30  },
+  'D60' : { iap: 'Revenue 60 days cumulative appsflyer af_purchase',  ad: 'Revenue 60 days cumulative appsflyer af_ad_revenue',  days: 60  },
+  'D90' : { iap: 'Revenue 90 days cumulative appsflyer af_purchase',  ad: 'Revenue 90 days cumulative appsflyer af_ad_revenue',  days: 90  },
+  'D180': { iap: 'Revenue 180 days cumulative appsflyer af_purchase', ad: 'Revenue 180 days cumulative appsflyer af_ad_revenue', days: 180 }
+};
+
+// ─── ENTRY POINTS ────────────────────────────────────────────────────────────
+
+function runScript() { main(); }
+
+function main() {
+  var folderId = extractFolderId(FOLDER_URL);
+  var sheetId  = extractSheetId(SHEET_URL);
+
+  // Load all CSV files from the folder, merge into one dataset
+  var allRows = loadAllCsvsFromFolder(folderId);
+  var headers = allRows[0];
+  var data    = allRows.slice(1);
+  var idx     = buildIndex(headers);
+
+  var today   = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  var maxDate = getMaxDate(data, idx);
+  Logger.log('📅 Max date in data: ' + formatDate(maxDate) + ' (today: ' + formatDate(today) + ')');
+
+  var pivotRows = []; // Для сборки данных по неделям
+  var summaryResults = []; // Для сборки данных листа results
+  var maxWindows = APPS[0].windows; // Берем структуру окон
+
+  // Process each app definition
+  for (var a = 0; a < APPS.length; a++) {
+    var app = APPS[a];
+    var results = {};
+
+    if (app.android) {
+      results.android = calcCoefficients(data, idx, app.android, app.windows, maxDate);
+      var weeklyAnd = calcWeeklyCoefficients(data, idx, app.android, app.windows, maxDate);
+      appendWeeklyDataToPivot(pivotRows, app.name, 'android', weeklyAnd, maxWindows);
+      summaryResults.push(buildSummaryRow(app.name + '_and', results.android, maxWindows));
+    }
+    if (app.ios) {
+      results.ios = calcCoefficients(data, idx, app.ios, app.windows, maxDate);
+      var weeklyIos = calcWeeklyCoefficients(data, idx, app.ios, app.windows, maxDate);
+      appendWeeklyDataToPivot(pivotRows, app.name, 'ios', weeklyIos, maxWindows);
+      summaryResults.push(buildSummaryRow(app.name + '_ios', results.ios, maxWindows));
+    }
+
+    writeAppSheet(sheetId, app, results, today, maxDate);
+    Logger.log('✅ ' + app.name + ' done.');
+  }
+
+  // Сортировка сводных данных результатов для удобства (по имени)
+  summaryResults.sort(function(a, b) { return a[0].localeCompare(b[0]); });
+  
+  // Write Results sheet
+  writeResultsSheet(sheetId, summaryResults, maxWindows);
+
+  // Сортировка для пивота: App -> Platform -> Week Start (Старая к новой)
+  pivotRows.sort(function(a, b) {
+    var appCmp = a[0].localeCompare(b[0]);
+    if (appCmp !== 0) return appCmp;
+    var platCmp = a[1].localeCompare(b[1]);
+    if (platCmp !== 0) return platCmp;
+    return a[2].localeCompare(b[2]); // Возрастание дат
+  });
+
+  // Write Weekly Pivot sheet
+  writeWeeklyPivotSheet(sheetId, pivotRows, maxWindows);
+
+  // Добавляем колонку "Week Start" в самый конец сырых данных
+  var colDateIdx = idx[COL_DATE];
+  allRows[0].push('Week Start'); 
+  for (var r = 1; r < allRows.length; r++) {
+    var d = parseDate(allRows[r][colDateIdx]);
+    if (d) {
+      allRows[r].push(getWeekStartString(d)); 
+    } else {
+      allRows[r].push('');
+    }
+  }
+
+  // Write raw data sheet (merged from all files)
+  writeRawData(sheetId, allRows);
+}
+
+// ─── CORE CALCULATION ────────────────────────────────────────────────────────
+
+function calcCoefficients(data, idx, appId, windows, today) {
+  var pairs = [];
+  for (var wi = 0; wi < windows.length; wi++) {
+    var wparts = windows[wi].split('/');
+    pairs.push({ label: windows[wi], num: wparts[0], den: wparts[1] });
+  }
+
+  var cutoffs = {};
+  for (var key in WINDOW_COLS) {
+    cutoffs[key] = addDays(today, -WINDOW_COLS[key].days);
+  }
+
+  var sums = {};
+  for (var pi = 0; pi < pairs.length; pi++) {
+    sums[pairs[pi].label] = { iapNum: 0, adNum: 0, iapDen: 0, adDen: 0, count: 0 };
+  }
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    if (!row[idx[COL_APP]] || row[idx[COL_APP]].trim() !== appId) continue;
+
+    var d = parseDate(row[idx[COL_DATE]]);
+    if (!d) continue;
+
+    for (var pj = 0; pj < pairs.length; pj++) {
+      var pair   = pairs[pj];
+      var numKey = pair.num;
+      var denKey = pair.den;
+
+      var cutoff = cutoffs[numKey];
+      if (d > cutoff) continue;
+
+      var numCols = WINDOW_COLS[numKey];
+      var denCols = WINDOW_COLS[denKey];
+
+      if (!numCols || !denCols) continue;
+      if (idx[numCols.iap] === undefined || idx[denCols.iap] === undefined) continue;
+
+      var iapNum = safeFloat(row[idx[numCols.iap]]);
+      var adNum  = safeFloat(row[idx[numCols.ad]]);
+      var iapDen = safeFloat(row[idx[denCols.iap]]);
+      var adDen  = safeFloat(row[idx[denCols.ad]]);
+
+      if (iapNum + adNum + iapDen + adDen > 0) {
+        sums[pair.label].iapNum += iapNum;
+        sums[pair.label].adNum  += adNum;
+        sums[pair.label].iapDen += iapDen;
+        sums[pair.label].adDen  += adDen;
+        sums[pair.label].count++;
+      }
+    }
+  }
+
+  var result = {};
+  for (var pk = 0; pk < pairs.length; pk++) {
+    var lbl    = pairs[pk].label;
+    var s      = sums[lbl];
+    var iapNum = s.iapNum * STORE_COMMISSION;
+    var iapDen = s.iapDen * STORE_COMMISSION;
+    var aaNum  = s.adNum;
+    var aaDen  = s.adDen;
+
+    result[lbl] = {
+      cohorts : s.count,
+      iapNum  : iapNum,
+      iapDen  : iapDen,
+      aaNum   : aaNum,
+      aaDen   : aaDen,
+      iapCoef : iapDen > 0 ? iapNum / iapDen : null,
+      aaCoef  : aaDen  > 0 ? aaNum  / aaDen  : null
+    };
+  }
+
+  return result;
+}
+
+function calcWeeklyCoefficients(data, idx, appId, windows, today) {
+  var pairs = [];
+  for (var wi = 0; wi < windows.length; wi++) {
+    var wparts = windows[wi].split('/');
+    pairs.push({ label: windows[wi], num: wparts[0], den: wparts[1] });
+  }
+
+  var cutoffs = {};
+  for (var key in WINDOW_COLS) {
+    cutoffs[key] = addDays(today, -WINDOW_COLS[key].days);
+  }
+
+  var weeklySums = {}; 
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    if (!row[idx[COL_APP]] || row[idx[COL_APP]].trim() !== appId) continue;
+
+    var d = parseDate(row[idx[COL_DATE]]);
+    if (!d) continue;
+
+    var weekStr = getWeekStartString(d);
+
+    if (!weeklySums[weekStr]) {
+      weeklySums[weekStr] = {};
+      for (var p = 0; p < pairs.length; p++) {
+        weeklySums[weekStr][pairs[p].label] = { iapNum: 0, adNum: 0, iapDen: 0, adDen: 0, count: 0 };
+      }
+    }
+
+    for (var pj = 0; pj < pairs.length; pj++) {
+      var pair   = pairs[pj];
+      var numKey = pair.num;
+      var denKey = pair.den;
+
+      var cutoff = cutoffs[numKey];
+      if (d > cutoff) continue; 
+
+      var numCols = WINDOW_COLS[numKey];
+      var denCols = WINDOW_COLS[denKey];
+
+      if (!numCols || !denCols || idx[numCols.iap] === undefined || idx[denCols.iap] === undefined) continue;
+
+      var iapNum = safeFloat(row[idx[numCols.iap]]);
+      var adNum  = safeFloat(row[idx[numCols.ad]]);
+      var iapDen = safeFloat(row[idx[denCols.iap]]);
+      var adDen  = safeFloat(row[idx[denCols.ad]]);
+
+      if (iapNum + adNum + iapDen + adDen > 0) {
+        weeklySums[weekStr][pair.label].iapNum += iapNum;
+        weeklySums[weekStr][pair.label].adNum  += adNum;
+        weeklySums[weekStr][pair.label].iapDen += iapDen;
+        weeklySums[weekStr][pair.label].adDen  += adDen;
+        weeklySums[weekStr][pair.label].count++;
+      }
+    }
+  }
+
+  var weeklyResults = {};
+  for (var w in weeklySums) {
+    weeklyResults[w] = {};
+    for (var pk = 0; pk < pairs.length; pk++) {
+      var lbl = pairs[pk].label;
+      var s   = weeklySums[w][lbl];
+      var iapNum = s.iapNum * STORE_COMMISSION;
+      var iapDen = s.iapDen * STORE_COMMISSION;
+      var aaNum  = s.adNum;
+      var aaDen  = s.adDen;
+
+      weeklyResults[w][lbl] = {
+        cohorts : s.count,
+        iapCoef : iapDen > 0 ? iapNum / iapDen : null,
+        aaCoef  : aaDen  > 0 ? aaNum  / aaDen  : null
+      };
+    }
+  }
+  return weeklyResults;
+}
+
+function buildSummaryRow(label, resultObj, windows) {
+  var row = [label];
+  for (var i = 0; i < windows.length; i++) {
+    var w = resultObj[windows[i]];
+    row.push(w && w.iapCoef !== null ? w.iapCoef : '');
+  }
+  for (var j = 0; j < windows.length; j++) {
+    var wAa = resultObj[windows[j]];
+    row.push(wAa && wAa.aaCoef !== null ? wAa.aaCoef : '');
+  }
+  return row;
+}
+
+function appendWeeklyDataToPivot(pivotRows, appName, platform, weeklyData, windows) {
+  var weeks = Object.keys(weeklyData); 
+  
+  for (var i = 0; i < weeks.length; i++) {
+    var w = weeks[i];
+    var row = [appName, platform, w];
+    var wData = weeklyData[w];
+
+    for (var j = 0; j < windows.length; j++) {
+      var wdIap = wData[windows[j]];
+      row.push(wdIap && wdIap.iapCoef !== null ? wdIap.iapCoef : '');
+    }
+    for (var k = 0; k < windows.length; k++) {
+      var wdAa = wData[windows[k]];
+      row.push(wdAa && wdAa.aaCoef !== null ? wdAa.aaCoef : '');
+    }
+    pivotRows.push(row);
+  }
+}
+
+// ─── GOOGLE SHEETS OUTPUT ────────────────────────────────────────────────────
+
+/**
+ * Writes the combined Results Sheet (similar to screenshot)
+ */
+function writeResultsSheet(sheetId, rowsData, windows) {
+  var ss    = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheetByName('results');
+
+  if (!sheet) {
+    sheet = ss.insertSheet('results');
+  } else {
+    sheet.clearContents();
+    sheet.clearFormats();
+  }
+
+  var headers = [''];
+  for (var i = 0; i < windows.length; i++) headers.push('IAP_' + windows[i]);
+  for (var j = 0; j < windows.length; j++) headers.push('IAA_' + windows[j]);
+
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold').setBackground('#d9e8fb').setFontColor('#1a4a8a')
+    .setHorizontalAlignment('center');
+
+  if (rowsData.length === 0) return;
+
+  sheet.getRange(2, 1, rowsData.length, headers.length).setValues(rowsData)
+    .setHorizontalAlignment('center');
+
+  // Раскрашиваем значения и фиксируем 4 знака
+  for (var r = 0; r < rowsData.length; r++) {
+    var sheetRow = r + 2;
+    for (var c = 0; c < windows.length * 2; c++) {
+       var val = rowsData[r][1 + c];
+       if (val !== '') {
+          sheet.getRange(sheetRow, 2 + c).setValue(parseFloat(val).toFixed(4));
+          styleCoefCell(sheet, sheetRow, 2 + c, parseFloat(val));
+       } else {
+          sheet.getRange(sheetRow, 2 + c).setValue('N/A');
+       }
+    }
+  }
+
+  sheet.setFrozenRows(1);
+  for (var c = 1; c <= headers.length; c++) sheet.autoResizeColumn(c);
+  Logger.log('✅ Results sheet done.');
+}
+
+
+/**
+ * Writes the Weekly Pivot Sheet (Без заливки)
+ */
+function writeWeeklyPivotSheet(sheetId, rowsData, windows) {
+  var ss    = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheetByName('Weekly Pivot');
+
+  if (!sheet) {
+    sheet = ss.insertSheet('Weekly Pivot');
+  } else {
+    sheet.clearContents();
+    sheet.clearFormats();
+  }
+
+  var headers = ['App', 'Platform', 'Week Start'];
+  for (var i = 0; i < windows.length; i++) headers.push('IAP_' + windows[i]);
+  for (var j = 0; j < windows.length; j++) headers.push('IAA_' + windows[j]);
+
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold').setBackground('#4a86e8').setFontColor('#ffffff')
+    .setHorizontalAlignment('center');
+
+  if (rowsData.length === 0) return;
+
+  sheet.getRange(2, 1, rowsData.length, headers.length).setValues(rowsData)
+    .setHorizontalAlignment('center');
+
+  // Округляем числа без цвета
+  var startColIap = 4;
+  for (var r = 0; r < rowsData.length; r++) {
+    var sheetRow = r + 2;
+    for (var c = 0; c < windows.length * 2; c++) { 
+       var val = rowsData[r][startColIap - 1 + c];
+       if (val !== '') {
+          sheet.getRange(sheetRow, startColIap + c).setValue(parseFloat(val).toFixed(4));
+       }
+    }
+  }
+
+  sheet.setFrozenRows(1);
+  for (var c = 1; c <= headers.length; c++) sheet.autoResizeColumn(c);
+  Logger.log('✅ Weekly Pivot done.');
+}
+
+
+function writeAppSheet(sheetId, app, results, today, maxDate) {
+  var ss    = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheetByName(app.name);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(app.name);
+  } else {
+    sheet.clearContents();
+    sheet.clearFormats();
+  }
+
+  var windows  = app.windows;
+  var hasAnd   = !!results.android;
+  var hasIos   = !!results.ios;
+
+  var summaryHdr = [''];
+  for (var wh1 = 0; wh1 < windows.length; wh1++) summaryHdr.push('IAP_' + windows[wh1]);
+  for (var wh2 = 0; wh2 < windows.length; wh2++) summaryHdr.push('IAA_' + windows[wh2]);
+  var numCols = summaryHdr.length;
+
+  sheet.getRange(1, 1, 1, numCols).merge()
+    .setValue(app.name + ' — data up to ' + formatDate(maxDate) + ' (run ' + formatDate(today) + ')')
+    .setFontWeight('bold').setBackground('#4a86e8').setFontColor('#ffffff').setFontSize(11);
+
+  sheet.getRange(2, 1, 1, numCols).setValues([summaryHdr])
+    .setFontWeight('bold').setBackground('#d9e8fb').setFontColor('#1a4a8a')
+    .setHorizontalAlignment('center');
+
+  var nextRow = 3;
+
+  function writeSummaryPlatformRow(label, platformResult) {
+    var rowVals = [label];
+    for (var wi1 = 0; wi1 < windows.length; wi1++) {
+      var wd1 = platformResult[windows[wi1]];
+      rowVals.push(wd1 ? fmtCoef(wd1.iapCoef) : 'N/A');
+    }
+    for (var wi2 = 0; wi2 < windows.length; wi2++) {
+      var wd2 = platformResult[windows[wi2]];
+      rowVals.push(wd2 ? fmtCoef(wd2.aaCoef) : 'N/A');
+    }
+    sheet.getRange(nextRow, 1, 1, numCols).setValues([rowVals]);
+    sheet.getRange(nextRow, 2, 1, numCols - 1).setHorizontalAlignment('center');
+
+    for (var wc1 = 0; wc1 < windows.length; wc1++) {
+      var wcd1 = platformResult[windows[wc1]];
+      if (wcd1) styleCoefCell(sheet, nextRow, 2 + wc1, wcd1.iapCoef);
+    }
+    for (var wc2 = 0; wc2 < windows.length; wc2++) {
+      var wcd2 = platformResult[windows[wc2]];
+      if (wcd2) styleCoefCell(sheet, nextRow, 2 + windows.length + wc2, wcd2.aaCoef);
+    }
+    nextRow++;
+  }
+
+  if (hasAnd) writeSummaryPlatformRow(app.name + '_and', results.android);
+  if (hasIos) writeSummaryPlatformRow(app.name + '_ios', results.ios);
+
+  nextRow += 1; 
+
+  function writeDetailHeader() {
+    var cols = ['Detail'];
+    if (hasAnd) cols.push('Android');
+    if (hasIos) cols.push('iOS');
+    sheet.getRange(nextRow, 1, 1, cols.length).setValues([cols])
+      .setFontWeight('bold').setBackground('#4a86e8').setFontColor('#ffffff')
+      .setHorizontalAlignment('center');
+    nextRow++;
+  }
+
+  function writeSectionHeader(label) {
+    var endCol = 1 + (hasAnd ? 1 : 0) + (hasIos ? 1 : 0);
+    sheet.getRange(nextRow, 1, 1, endCol).merge()
+      .setValue(label).setFontWeight('bold')
+      .setBackground('#f3f3f3').setFontColor('#333333');
+    nextRow++;
+  }
+
+  function writeDetailRow(label, andVal, iosVal) {
+    var vals = [label];
+    if (hasAnd) vals.push(andVal !== undefined ? andVal : '');
+    if (hasIos) vals.push(iosVal !== undefined ? iosVal : '');
+    var endCol = vals.length;
+    sheet.getRange(nextRow, 1, 1, endCol).setValues([vals]);
+    sheet.getRange(nextRow, 2, 1, endCol - 1).setHorizontalAlignment('center');
+    nextRow++;
+  }
+
+  writeDetailHeader();
+
+  writeSectionHeader('COHORTS');
+  for (var wh = 0; wh < windows.length; wh++) {
+    var whLabel  = windows[wh];
+    var whNum    = whLabel.split('/')[0];
+    var whCutoff = formatDate(addDays(maxDate, -WINDOW_COLS[whNum].days));
+    var andCount = hasAnd && results.android[whLabel] ? results.android[whLabel].cohorts + ' cohorts' : 'N/A';
+    var iosCount = hasIos && results.ios[whLabel]     ? results.ios[whLabel].cohorts     + ' cohorts' : 'N/A';
+    writeDetailRow('Cohorts for ' + whLabel + '  (installs ≤ ' + whCutoff + ')', andCount, iosCount);
+  }
+
+  for (var wd = 0; wd < windows.length; wd++) {
+    var wdLabel  = windows[wd];
+    var wdParts  = wdLabel.split('/');
+    var wdNum    = wdParts[0];
+    var wdDen    = wdParts[1];
+    var andData  = hasAnd ? results.android[wdLabel] : null;
+    var iosData  = hasIos ? results.ios[wdLabel]     : null;
+
+    writeSectionHeader('IAP — ' + wdLabel + '  (×0.85, cohorts closed at ' + wdNum + ')');
+    writeDetailRow('IAP ' + wdDen + ' $  (denominator)', andData ? fmtRev(andData.iapDen) : '', iosData ? fmtRev(iosData.iapDen) : '');
+    writeDetailRow('IAP ' + wdNum + ' $  (numerator)',   andData ? fmtRev(andData.iapNum) : '', iosData ? fmtRev(iosData.iapNum) : '');
+    writeDetailRow('IAP Coef ' + wdLabel,                andData ? fmtCoef(andData.iapCoef) : '', iosData ? fmtCoef(iosData.iapCoef) : '');
+
+    writeSectionHeader('IAA — ' + wdLabel + '  (ad revenue, cohorts closed at ' + wdNum + ')');
+    writeDetailRow('IAA ' + wdDen + ' $  (denominator)', andData ? fmtRev(andData.aaDen) : '', iosData ? fmtRev(iosData.aaDen) : '');
+    writeDetailRow('IAA ' + wdNum + ' $  (numerator)',   andData ? fmtRev(andData.aaNum) : '', iosData ? fmtRev(iosData.aaNum) : '');
+    writeDetailRow('IAA Coef ' + wdLabel,                andData ? fmtCoef(andData.aaCoef) : '', iosData ? fmtCoef(iosData.aaCoef) : '');
+  }
+
+  writeSectionHeader('METADATA');
+  writeDetailRow('Script run at', formatDate(today), '');
+  writeDetailRow('Source', 'All CSVs from Drive folder', '');
+
+  sheet.setColumnWidth(1, 380);
+  for (var wc2 = 2; wc2 <= numCols; wc2++) sheet.setColumnWidth(wc2, 120);
+
+  sheet.setFrozenRows(1);
+}
+
+// ─── RAW DATA SHEET ──────────────────────────────────────────────────────────
+
+function writeRawData(sheetId, rows) {
+  var ss    = SpreadsheetApp.openById(sheetId);
+  var sheet = ss.getSheetByName('row data');
+
+  if (!sheet) {
+    sheet = ss.insertSheet('row data');
+  } else {
+    sheet.clearContents();
+    sheet.clearFormats();
+  }
+
+  if (rows.length > 0) {
+    sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  sheet.getRange(1, 1, 1, rows[0].length)
+    .setFontWeight('bold').setBackground('#4a86e8').setFontColor('#ffffff');
+  sheet.setFrozenRows(1);
+
+  for (var c = 1; c <= rows[0].length; c++) sheet.autoResizeColumn(c);
+
+  Logger.log('✅ Raw data: ' + (rows.length - 1) + ' rows written.');
+}
+
+// ─── DRIVE FILE LOADING ──────────────────────────────────────────────────────
+
+function loadAllCsvsFromFolder(folderId) {
+  var folder  = DriveApp.getFolderById(folderId);
+  var files   = folder.getFilesByType(MimeType.CSV);
+  var headers = null;
+  var allData = [];
+
+  while (files.hasNext()) {
+    var file = files.next();
+    Logger.log('📄 Loading: ' + file.getName());
+    var rows = parseCsv(file.getBlob().getDataAsString('UTF-8'));
+    if (rows.length < 2) continue;
+
+    if (!headers) {
+      headers = rows[0];
+    }
+    for (var r = 1; r < rows.length; r++) {
+      allData.push(rows[r]);
+    }
+  }
+
+  if (!headers) throw new Error('No CSV files found in folder.');
+
+  return [headers].concat(allData);
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+
+function extractFolderId(url) {
+  var match = url.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+  if (!match) throw new Error('Could not parse folder ID from URL: ' + url);
+  return match[1];
+}
+
+function extractSheetId(url) {
+  var match = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+  if (!match) throw new Error('Could not parse spreadsheet ID from URL: ' + url);
+  return match[1];
+}
+
+function parseCsv(text) {
+  var rows = [], lines = text.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (line) rows.push(splitCsvLine(line));
+  }
+  return rows;
+}
+
+function splitCsvLine(line) {
+  var result = [], current = '', inQuote = false;
+  for (var i = 0; i < line.length; i++) {
+    var ch = line[i];
+    if (ch === '"')                  { inQuote = !inQuote; }
+    else if (ch === ',' && !inQuote) { result.push(current.trim()); current = ''; }
+    else                             { current += ch; }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+function buildIndex(headers) {
+  var idx = {};
+  for (var i = 0; i < headers.length; i++) idx[headers[i].trim()] = i;
+  return idx;
+}
+
+function getMaxDate(data, idx) {
+  var max = null;
+  for (var i = 0; i < data.length; i++) {
+    var d = parseDate(data[i][idx[COL_DATE]]);
+    if (d && (!max || d > max)) max = d;
+  }
+  if (!max) {
+    var fallback = new Date();
+    fallback.setHours(0, 0, 0, 0);
+    return fallback;
+  }
+  return max;
+}
+
+function parseDate(str) {
+  if (!str) return null;
+  str = str.trim();
+  var parts, d;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    parts = str.split('-');
+    d = new Date(+parts[0], +parts[1] - 1, +parts[2]);
+  } else if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(str)) {
+    parts = str.split('/');
+    d = new Date(+parts[2], +parts[0] - 1, +parts[1]);
+  } else {
+    return null;
+  }
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function getWeekStartString(date) {
+  var d = new Date(date.getTime());
+  var day = d.getDay();
+  var diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  d.setDate(diff);
+  return formatDate(d);
+}
+
+function addDays(date, days) {
+  var d = new Date(date.getTime());
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
+function formatDate(date) {
+  return date.getFullYear() + '-' +
+    String(date.getMonth() + 1).padStart(2, '0') + '-' +
+    String(date.getDate()).padStart(2, '0');
+}
+
+function safeFloat(val) { var n = parseFloat(val); return isNaN(n) ? 0 : n; }
+function fmtRev(v)      { return v !== null && v !== undefined ? v.toFixed(2) : ''; }
+function fmtCoef(v)     { return v !== null && v !== undefined ? v.toFixed(4) : 'N/A'; }
+
+function styleCoefCell(sheet, row, col, coef) {
+  if (coef === null || coef === undefined) return;
+  var color = coef >= 1.2 ? '#b7e1cd' : coef >= 1.0 ? '#fce8b2' : '#f4c7c3';
+  sheet.getRange(row, col).setBackground(color).setFontWeight('bold');
+}
